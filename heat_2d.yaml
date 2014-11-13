@@ -1,0 +1,213 @@
+heat_template_version: 2013-05-23
+
+description: This template deploys a Flasky single instance server with a SQLite database.
+
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for the server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  public_network:
+    type: string
+    label: Public network name or ID
+    description: Public network with floating IP addresses.
+    default: public-net
+  gmail_username:
+    type: string
+    label: Gmail account username
+    description: Username of the Gmail account to use for notifications.
+  gmail_password:
+    type: string
+    label: Gmail account password
+    description: Password of the Gmail account to use for notifications.
+    hidden: true
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1
+      timeout: 600
+
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  flask_secret_key:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: lettersdigits
+
+  web_server_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: web_server_security_group
+      rules:
+        - protocol: icmp
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+
+  private_network:
+    type: OS::Neutron::Net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_network }
+      cidr: 10.10.10.0/24
+      dns_nameservers:
+        - 8.8.8.8
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_network }
+
+  router-interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet: { get_resource: private_subnet }
+
+  flasky_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      security_groups:
+        - { get_resource: web_server_security_group }
+
+  flasky_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: flasky_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __flask_secret_key__: { get_attr: [flask_secret_key, value] }
+            __gmail_username__: { get_param: gmail_username }
+            __gmail_password__: { get_param: gmail_password }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+          template: |
+            #!/bin/bash -ex
+
+            # install dependencies
+            apt-get update
+            apt-get -y install build-essential python python-dev python-virtualenv nginx supervisor git
+
+            # create a flasky user to run the server process
+            adduser --disabled-password --gecos "" flasky
+
+            # clone flasky from github
+            cd /home/flasky
+            git clone https://github.com/miguelgrinberg/flasky.git
+            cd flasky
+
+            # Write configuration file
+            cat >.env <<EOF
+            FLASK_CONFIG=heroku
+            SECRET_KEY=__flask_secret_key__
+            DATABASE_URL=sqlite:////home/flasky/flasky/appdb.sqlite
+            MAIL_USERNAME=__gmail_username__
+            MAIL_PASSWORD=__gmail_password__
+            FLASKY_ADMIN=__gmail_username__@gmail.com
+            SSL_DISABLE=1
+            EOF
+
+            # create a virtualenv and install dependencies
+            virtualenv venv
+            venv/bin/pip install -r requirements/prod.txt
+            venv/bin/pip install gunicorn==18.0
+
+            # create database
+            venv/bin/python manage.py deploy
+
+            # make the flasky user the owner of the application
+            chown -R flasky:flasky ./
+
+            # configure supervisor to run a private gunicorn web server, and
+            # to autostart it on boot and when it crashes
+            # stdout and stderr logs from the server will go to /var/log/flasky
+            mkdir /var/log/flasky
+            cat >/etc/supervisor/conf.d/flasky.conf <<EOF
+            [program:flasky]
+            command=/home/flasky/flasky/venv/bin/gunicorn -b 127.0.0.1:8000 -w 4 --chdir /home/flasky/flasky --log-file - manage:app
+            user=flasky
+            autostart=true
+            autorestart=true
+            stderr_logfile=/var/log/flasky/stderr.log
+            stdout_logfile=/var/log/flasky/stdout.log
+            EOF
+            supervisorctl reread
+            supervisorctl update
+
+            # configure nginx as the front-end web server with a reverse proxy
+            # rule to the gunicorn server
+            cat >/etc/nginx/sites-available/flasky <<EOF
+            server {
+                listen 80;
+                server_name _;
+                access_log /var/log/nginx/flasky.access.log;
+                error_log /var/log/nginx/flasky.error.log;
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_redirect off;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+                location /static {
+                    alias /home/flasky/flasky/static;
+                }
+                location /favicon.ico {
+                    alias /home/flasky/flasky/favicon.ico;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -s /etc/nginx/sites-available/flasky /etc/nginx/sites-enabled/
+            service nginx restart
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_network }
+
+  floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: floating_ip }
+      port_id: { get_resource: flasky_port }
+
+outputs:
+  instance_name:
+    description: Name of the instance
+    value: { get_attr: [flasky_instance, name] }
+  instance_ip:
+    description: The IP address of the deployed instance
+    value: { get_attr: [floating_ip, floating_ip_address] }
