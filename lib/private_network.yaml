@@ -1,0 +1,48 @@
+heat_template_version: 2013-05-23
+
+description: Template that creates a private network.
+
+parameters:
+  public_network:
+    type: string
+    label: Public network name or ID
+    description: Public network with floating IP addresses.
+    default: public
+  cidr:
+    type: string
+    label: CIDR
+    description: The CIDR of the private network.
+    default: '10.10.10.0/24'
+  dns:
+    type: comma_delimited_list
+    label: DNS nameservers
+    description: Comma separated list of DNS nameservers for the private network.
+    default: '8.8.8.8'
+
+resources:
+  private_network:
+    type: OS::Neutron::Net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_network }
+      cidr: 10.10.10.0/24
+      dns_nameservers: { get_param: dns }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_network }
+
+  router-interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet: { get_resource: private_subnet }
+
+outputs:
+  name:
+    description: The private network.
+    value: { get_attr: [private_network, name] }

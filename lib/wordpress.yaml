@@ -1,0 +1,126 @@
+heat_template_version: 2013-05-23
+ 
+description: Template that installs a wordpress server.
+ 
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  private_network:
+    type: string
+    label: Private network name or ID
+    description: Network to attach server to.
+    default: private
+  mysql_server:
+    type: string
+    label: MySQL database server
+    description: IP address of the MySQL database server.
+  database_name:
+    type: string
+    label: Database name
+    description: Name of the application database.
+  database_user:
+    type: string
+    label: Database user
+    description: Name of the database user.
+  database_password:
+    type: string
+    label: Database password
+    hidden: true
+    description: Password to access the database.
+ 
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1
+      timeout: 600
+ 
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+ 
+  security_group:
+      type: OS::Neutron::SecurityGroup
+      properties:
+        name: web_server_security_group
+        rules:
+          - protocol: tcp
+            port_range_min: 80
+            port_range_max: 80
+ 
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: security_group }
+
+  wordpress_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __mysql_ip__: { get_param: mysql_server }
+            __database_name__: { get_param: database_name }
+            __database_user__: { get_param: database_user }
+            __database_password__: { get_param: database_password }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+          template: |
+            #!/bin/bash -ex
+
+            # install dependencies
+            apt-get update
+            apt-get -y install apache2 php5 libapache2-mod-php5 php5-mysql php5-gd mysql-client
+ 
+            # download wordpress
+            wget http://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+ 
+            # configure wordpress
+            cp wordpress/wp-config-sample.php wordpress/wp-config.php
+            sed -i 's/database_name_here/__database_name__/' wordpress/wp-config.php
+            sed -i 's/username_here/__database_user__/' wordpress/wp-config.php
+            sed -i 's/password_here/__database_password__/' wordpress/wp-config.php
+            sed -i 's/localhost/__mysql_ip__/' wordpress/wp-config.php
+ 
+            # install a copy of the configured wordpress into apache's www directory
+            rm /var/www/html/index.html
+            cp -R wordpress/* /var/www/html/
+ 
+            # give apache ownership of the application files
+            chown -R www-data:www-data /var/www/html/
+            chmod -R g+w /var/www/html/
+ 
+            # notify heat that we are done here
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+outputs:
+  name:
+    description: Name of the wordpress instance.
+    value: { get_attr: [wordpress_instance, name] }
+  ip:
+    description: The IP address of the wordpress instance.
+    value: { get_attr: [wordpress_instance, first_address] }
+  port:
+    description: The network port of the wordpress instance.
+    value: { get_resource: port }

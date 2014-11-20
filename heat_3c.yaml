@@ -1,0 +1,64 @@
+heat_template_version: 2013-05-23
+ 
+description: Template that installs a wordpress server and supporting MySQL database running on separate servers
+ 
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  public_network:
+    type: string
+    label: Public network name or ID
+    description: Public network to attach server to.
+    default: public
+ 
+resources:
+  network:
+    type: lib/private_network.yaml
+    properties:
+      public_network: { get_param: public_network }
+
+  mysql:
+    type: lib/mysql.yaml
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key: { get_param: key }
+      private_network: { get_attr: [network, name] }
+      database_name: wordpress
+      database_user: wordpress_user
+ 
+  wordpress:
+    type: lib/wordpress.yaml
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key: { get_param: key }
+      private_network: { get_attr: [network, name] }
+      mysql_server: { get_attr: [mysql, ip] }
+      database_name: wordpress
+      database_user: wordpress_user
+      database_password: { get_attr: [mysql, database_password] }
+
+  floating_ip:
+    type: lib/floating_ip.yaml
+    properties:
+      port: { get_attr: [wordpress, port] }
+      public_network: { get_param: public_network }
+
+outputs:
+  ip:
+    description: The public IP address to access Wordpress.
+    value: { get_attr: [floating_ip, ip] }

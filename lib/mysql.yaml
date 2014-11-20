@@ -1,0 +1,135 @@
+heat_template_version: 2013-05-23
+ 
+description: Template that installs a MySQL server with a database.
+ 
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  private_network:
+    type: string
+    label: Private network name or ID
+    description: Network to attach server to.
+    default: private
+  database_name:
+    type: string
+    label: Database name
+    description: Name of the application database.
+  database_user:
+    type: string
+    label: Database username
+    description: Name of the database user.
+ 
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1
+      timeout: 600
+ 
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+ 
+  mysql_root_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: lettersdigits
+ 
+  database_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: lettersdigits
+ 
+  security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: db_server_security_group
+      rules:
+        - protocol: tcp
+          port_range_min: 3306
+          port_range_max: 3306
+ 
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: security_group }
+      
+  mysql_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __mysql_root_password__: { get_attr: [mysql_root_password, value] }
+            __database_name__: { get_param: database_name }
+            __database_user__: { get_param: database_user }
+            __database_password__: { get_attr: [database_password, value] }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+          template: |
+            #!/bin/bash
+
+            # install MySQL
+            apt-get update
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y mysql-server
+ 
+            # configure MySQL root password
+            mysqladmin -u root password "__mysql_root_password__"
+ 
+            # listen on all network interfaces
+            sed -i "s/bind-address.*/bind-address = 0.0.0.0/" /etc/mysql/my.cnf
+ 
+            # restart service
+            service mysql restart
+ 
+            # create wordpress database
+            mysql -u root --password="__mysql_root_password__" <<EOF
+            CREATE DATABASE __database_name__;
+            CREATE USER '__database_user__'@'localhost';
+            SET PASSWORD FOR '__database_user__'@'localhost'=PASSWORD("__database_password__");
+            GRANT ALL PRIVILEGES ON __database_name__.* TO '__database_user__'@'localhost' IDENTIFIED BY '__database_password__';
+            CREATE USER '__database_user__'@'%';
+            SET PASSWORD FOR '__database_user__'@'%'=PASSWORD("__database_password__");
+            GRANT ALL PRIVILEGES ON __database_name__.* TO '__database_user__'@'%' IDENTIFIED BY '__database_password__';
+            FLUSH PRIVILEGES;
+            EOF
+ 
+            # notify heat that we are done here
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+outputs:
+  name:
+    description: Name of the MySQL instance.
+    value: { get_attr: [mysql_instance, name] }
+  ip:
+    description: The IP address of the MySQL instance.
+    value: { get_attr: [mysql_instance, first_address] }
+  port:
+    description: The network port of the MySQL instance.
+    value: { get_resource: port }
+  database_password:
+    description: The MySQL database password.
+    value: { get_attr: [database_password, value] }
