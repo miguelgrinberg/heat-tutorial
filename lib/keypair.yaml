@@ -1,0 +1,37 @@
+heat_template_version: 2013-05-23
+
+description: Template that creates a keypair.
+
+parameters:
+  prefix:
+    type: string
+    label: Name prefix
+    description: The prefix to use for the keypair name.
+
+resources:
+  keypair:
+    type: OS::Nova::KeyPair
+    properties:
+      name:
+        str_replace:
+          params:
+            __prefix__: { get_param: prefix }
+            __id__: { get_param: "OS::stack_name" }
+          template: __prefix__-__id__
+      save_private_key: true
+
+outputs:
+  name:
+    description: The name of the keypair.
+    value:
+        str_replace:
+          params:
+            __prefix__: { get_param: prefix }
+            __id__: { get_param: "OS::stack_name" }
+          template: __prefix__-__id__
+  public_key:
+    description: The public key of the keypair.
+    value: { get_attr: [keypair, public_key] }
+  private_key:
+    description: The private key of the keypair.
+    value: { get_attr: [keypair, private_key] }

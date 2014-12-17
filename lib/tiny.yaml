@@ -1,0 +1,151 @@
+heat_template_version: 2013-05-23
+
+description: Template that installs a small example web server.
+
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  private_network:
+    type: string
+    label: Private network name or ID
+    description: Network to attach server to.
+    default: private
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wh }
+      count: 1
+      timeout: 600
+
+  wh:
+    type: OS::Heat::WaitConditionHandle
+
+  security_group:
+      type: OS::Neutron::SecurityGroup
+      properties:
+        name: web_server_security_group
+        rules:
+          - protocol: tcp
+            port_range_min: 80
+            port_range_max: 80
+
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: security_group }
+
+  tiny_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            wc_notify: { get_attr: ['wh', 'curl_cli'] }
+          template: |
+            #!/bin/bash -ex
+
+            # install dependencies
+            apt-get update
+            apt-get -y install build-essential python python-dev python-virtualenv nginx supervisor git
+
+            # create a tiny user to run the server process
+            adduser --disabled-password --gecos "" tiny
+
+            # install the tiny application
+            cd /home/tiny
+            cat >app.py <<EOF
+            #!/usr/bin/env python
+            import socket
+            from flask import Flask
+
+            hostname = socket.gethostname()
+            app = Flask(__name__)
+
+            @app.route('/')
+            def index():
+                return 'Hello from {0}!'.format(hostname)
+
+            if __name__ == '__main__':
+                app.run(debug=True)
+            EOF
+
+            # create a virtualenv and install dependencies
+            virtualenv venv
+            venv/bin/pip install flask gunicorn==18.0
+
+            # make the tiny user the owner of the application
+            chown -R tiny:tiny app.py
+
+            # configure supervisor to run a private gunicorn web server, and
+            # to autostart it on boot and when it crashes
+            # stdout and stderr logs from the server will go to /var/log/tiny
+            mkdir /var/log/tiny
+            cat >/etc/supervisor/conf.d/tiny.conf <<EOF
+            [program:tiny]
+            command=/home/tiny/venv/bin/gunicorn -b 127.0.0.1:8000 -w 4 --chdir /home/tiny --log-file - app:app
+            user=tiny
+            autostart=true
+            autorestart=true
+            stderr_logfile=/var/log/tiny/stderr.log
+            stdout_logfile=/var/log/tiny/stdout.log
+            EOF
+            supervisorctl reread
+            supervisorctl update
+
+            # configure nginx as the front-end web server with a reverse proxy
+            # rule to the gunicorn server
+            cat >/etc/nginx/sites-available/tiny <<EOF
+            server {
+                listen 80;
+                server_name _;
+                access_log /var/log/nginx/tiny.access.log;
+                error_log /var/log/nginx/tiny.error.log;
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_redirect off;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -s /etc/nginx/sites-available/tiny /etc/nginx/sites-enabled/
+            service nginx restart
+
+            # let Heat know we are done
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+outputs:
+  name:
+    description: Name of the tiny instance.
+    value: { get_attr: [tiny_instance, name] }
+  ip:
+    description: The IP address of the tiny instance.
+    value: { get_attr: [tiny_instance, first_address] }
+  port:
+    description: The network port of the Flasky instance.
+    value: { get_resource: port }

@@ -1,0 +1,187 @@
+heat_template_version: 2013-05-23
+
+description: Template that installs a Flasky server.
+
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  private_network:
+    type: string
+    label: Private network name or ID
+    description: Network to attach server to.
+    default: private
+  mysql_server:
+    type: string
+    label: MySQL database server
+    description: IP address of the MySQL database server.
+  database_name:
+    type: string
+    label: Database name
+    description: Name of the application database.
+  database_user:
+    type: string
+    label: Database user
+    description: Name of the database user.
+  database_password:
+    type: string
+    label: Database password
+    hidden: true
+    description: Password to access the database.
+  gmail_username:
+    type: string
+    label: Gmail account username
+    description: Username of the Gmail account to use for notifications.
+  gmail_password:
+    type: string
+    label: Gmail account password
+    description: Password of the Gmail account to use for notifications.
+    hidden: true
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wh }
+      count: 1
+      timeout: 600
+
+  wh:
+    type: OS::Heat::WaitConditionHandle
+
+  security_group:
+      type: OS::Neutron::SecurityGroup
+      properties:
+        name: web_server_security_group
+        rules:
+          - protocol: tcp
+            port_range_min: 80
+            port_range_max: 80
+
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: security_group }
+
+  flasky_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __mysql_ip__: { get_param: mysql_server }
+            __database_name__: { get_param: database_name }
+            __database_user__: { get_param: database_user }
+            __database_password__: { get_param: database_password }
+            wc_notify: { get_attr: ['wh', 'curl_cli'] }
+          template: |
+            #!/bin/bash -ex
+
+            # install dependencies
+            apt-get update
+            apt-get -y install build-essential python python-dev python-virtualenv libmysqlclient-dev nginx supervisor git
+
+            # create a flasky user to run the server process
+            adduser --disabled-password --gecos "" flasky
+
+            # clone flasky from github
+            cd /home/flasky
+            git clone https://github.com/miguelgrinberg/flasky.git
+            cd flasky
+
+            # Write configuration file
+            cat >.env <<EOF
+            FLASK_CONFIG=heroku
+            SECRET_KEY=__flask_secret_key__
+            DATABASE_URL=mysql://__database_user__:__database_password__@__mysql_ip__/__database_name__
+            MAIL_USERNAME=__gmail_username__
+            MAIL_PASSWORD=__gmail_password__
+            FLASKY_ADMIN=__gmail_username__@gmail.com
+            SSL_DISABLE=1
+            EOF
+
+            # create a virtualenv and install dependencies
+            virtualenv venv
+            venv/bin/pip install -r requirements/prod.txt
+            venv/bin/pip install mysql-python gunicorn==18.0
+
+            # create database
+            venv/bin/python manage.py deploy
+
+            # make the flasky user the owner of the application
+            chown -R flasky:flasky ./
+
+            # configure supervisor to run a private gunicorn web server, and
+            # to autostart it on boot and when it crashes
+            # stdout and stderr logs from the server will go to /var/log/flasky
+            mkdir /var/log/flasky
+            cat >/etc/supervisor/conf.d/flasky.conf <<EOF
+            [program:flasky]
+            command=/home/flasky/flasky/venv/bin/gunicorn -b 127.0.0.1:8000 -w 4 --chdir /home/flasky/flasky --log-file - manage:app
+            user=flasky
+            autostart=true
+            autorestart=true
+            stderr_logfile=/var/log/flasky/stderr.log
+            stdout_logfile=/var/log/flasky/stdout.log
+            EOF
+            supervisorctl reread
+            supervisorctl update
+
+            # configure nginx as the front-end web server with a reverse proxy
+            # rule to the gunicorn server
+            cat >/etc/nginx/sites-available/flasky <<EOF
+            server {
+                listen 80;
+                server_name _;
+                access_log /var/log/nginx/flasky.access.log;
+                error_log /var/log/nginx/flasky.error.log;
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_redirect off;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+                location /static {
+                    alias /home/flasky/flasky/static;
+                }
+                location /favicon.ico {
+                    alias /home/flasky/flasky/favicon.ico;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -s /etc/nginx/sites-available/flasky /etc/nginx/sites-enabled/
+            service nginx restart
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+outputs:
+  name:
+    description: Name of the Flasky instance.
+    value: { get_attr: [flasky_instance, name] }
+  ip:
+    description: The IP address of the Flasky instance.
+    value: { get_attr: [flasky_instance, first_address] }
+  port:
+    description: The network port of the Flasky instance.
+    value: { get_resource: port }

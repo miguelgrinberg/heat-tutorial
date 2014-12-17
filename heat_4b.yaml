@@ -1,0 +1,68 @@
+heat_template_version: 2013-05-23
+
+description: Template that installs a cluster of servers with a load balancer.
+
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  public_network:
+    type: string
+    label: Public network name or ID
+    description: Public network to attach server to.
+    default: public
+  cluster_size:
+    type: number
+    label: Cluster size
+    description: Number of instances in cluster.
+    default: 2
+
+resources:
+  network:
+    type: Lib::MSG::PrivateNetwork
+    properties:
+      public_network: { get_param: public_network }
+
+  tiny_cluster:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: { get_param: cluster_size }
+      resource_def:
+        type: Lib::MSG::Tiny
+        properties:
+          image: { get_param: image }
+          flavor: { get_param: flavor }
+          key: { get_param: key }
+          private_network: { get_attr: [network, name] }
+
+  load_balancer:
+    type: Lib::MSG::HAProxy
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key: { get_param: key }
+      private_network: { get_attr: [network, name] }
+      servers: { get_attr: [tiny_cluster, ip] }
+
+  floating_ip:
+    type: Lib::MSG::FloatingIP
+    properties:
+      port: { get_attr: [load_balancer, port] }
+      public_network: { get_param: public_network }
+
+outputs:
+  ip:
+    description: The public IP address to access the server.
+    value: { get_attr: [floating_ip, ip] }

@@ -1,7 +1,7 @@
 heat_template_version: 2013-05-23
- 
+
 description: Template that installs a wordpress server.
- 
+
 parameters:
   image:
     type: string
@@ -40,18 +40,18 @@ parameters:
     label: Database password
     hidden: true
     description: Password to access the database.
- 
+
 resources:
   wait_condition:
     type: OS::Heat::WaitCondition
     properties:
-      handle: { get_resource: wait_handle }
+      handle: { get_resource: wh }
       count: 1
       timeout: 600
- 
-  wait_handle:
+
+  wh:
     type: OS::Heat::WaitConditionHandle
- 
+
   security_group:
       type: OS::Neutron::SecurityGroup
       properties:
@@ -60,7 +60,7 @@ resources:
           - protocol: tcp
             port_range_min: 80
             port_range_max: 80
- 
+
   port:
     type: OS::Neutron::Port
     properties:
@@ -84,33 +84,33 @@ resources:
             __database_name__: { get_param: database_name }
             __database_user__: { get_param: database_user }
             __database_password__: { get_param: database_password }
-            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+            wc_notify: { get_attr: ['wh', 'curl_cli'] }
           template: |
             #!/bin/bash -ex
 
             # install dependencies
             apt-get update
             apt-get -y install apache2 php5 libapache2-mod-php5 php5-mysql php5-gd mysql-client
- 
+
             # download wordpress
             wget http://wordpress.org/latest.tar.gz
             tar -xzf latest.tar.gz
- 
+
             # configure wordpress
             cp wordpress/wp-config-sample.php wordpress/wp-config.php
             sed -i 's/database_name_here/__database_name__/' wordpress/wp-config.php
             sed -i 's/username_here/__database_user__/' wordpress/wp-config.php
             sed -i 's/password_here/__database_password__/' wordpress/wp-config.php
             sed -i 's/localhost/__mysql_ip__/' wordpress/wp-config.php
- 
+
             # install a copy of the configured wordpress into apache's www directory
             rm /var/www/html/index.html
             cp -R wordpress/* /var/www/html/
- 
+
             # give apache ownership of the application files
             chown -R www-data:www-data /var/www/html/
             chmod -R g+w /var/www/html/
- 
+
             # notify heat that we are done here
             wc_notify --data-binary '{"status": "SUCCESS"}'
 

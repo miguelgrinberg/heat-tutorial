@@ -1,0 +1,154 @@
+heat_template_version: 2013-05-23
+
+description: Template that installs a HAProxy server.
+
+parameters:
+  image:
+    type: string
+    label: Image name or ID
+    description: Image to be used for server. Please use an Ubuntu based image.
+    default: trusty-server-cloudimg-amd64
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance (flavor) to be used on the compute instance.
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be installed on the compute instance.
+    default: my_key
+  private_network:
+    type: string
+    label: Private network name or ID
+    description: Network to attach server to.
+    default: private
+  servers:
+    type: comma_delimited_list
+    label: Servers
+    description: Comma separated list of servers in the cluster.
+  port_number:
+    type: number
+    label: Port number
+    description: Port number to proxy.
+    default: 80
+
+resources:
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      count: 1
+      timeout: 600
+
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  security_group:
+      type: OS::Neutron::SecurityGroup
+      properties:
+        name: web_server_security_group
+        rules:
+          - protocol: tcp
+            port_range_min: { get_param: port_number }
+            port_range_max: { get_param: port_number }
+
+  port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: private_network }
+      security_groups:
+        - { get_resource: security_group }
+      replacement_policy: AUTO
+
+  haproxy_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: port }
+      metadata:
+        servers: { get_param: servers }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __port__: { get_param: port_number }
+            wc_notify: { get_attr: ['wait_handle', 'curl_cli'] }
+          template: |
+            #!/bin/bash -ex
+
+            # install dependencies
+            apt-get update
+            apt-get -y install build-essential python python-dev python-virtualenv supervisor haproxy
+
+            sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/haproxy
+
+            # save haproxy original configuration
+            cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy_base.cfg
+
+            # write an initial empty list of worker servers
+            cat >>/etc/haproxy/servers.json <<EOF
+            []
+            EOF
+
+            # write the update script
+            cat >>/etc/haproxy/update.py <<EOF
+            import sys
+            import json
+            import subprocess
+
+            # load server list from metadata
+            metadata = json.loads(sys.stdin.read())
+            new_servers = json.loads(metadata.get('meta', {}).get('servers', '[]'))
+            if not new_servers:
+                sys.exit(1)  # bad metadata
+
+            # compare against known list of servers
+            current_servers = json.loads(open('/etc/haproxy/servers.json').read())
+            if current_servers == new_servers:
+                sys.exit(0)  # no changes
+
+            # record updated list of servers
+            open('/etc/haproxy/servers.json', 'wt').write(json.dumps(new_servers))
+
+            # generate a new haproxy config file
+            f = open('/etc/haproxy/haproxy.cfg', 'wt')
+            f.write(open('/etc/haproxy/haproxy_base.cfg').read())
+            f.write("""
+            listen app *:80
+                mode http
+                balance roundrobin
+                option httpclose
+                option forwardfor
+            """)
+            for i, server in enumerate(new_servers):
+                f.write('    server server-{0} {1}:{2}\n'.format(i, server, __port__))
+            f.close()
+
+            # reload haproxy's configuration
+            print('Reloading haproxy with servers: ' + ', '.join(new_servers))
+            subprocess.call(['service', 'haproxy', 'reload'])
+            EOF
+
+            # add a cron job to monitor the metadata and update haproxy
+            crontab -l >_crontab || true
+            echo "* * * * * curl -s http://169.254.169.254/openstack/latest/meta_data.json | python /etc/haproxy/update.py | /usr/bin/logger -t haproxy_update" >>_crontab
+            crontab <_crontab
+            rm _crontab
+
+            # let Heat know that we are done here
+            wc_notify --data-binary '{"status": "SUCCESS"}'
+
+outputs:
+  name:
+    description: Name of the HAProxy instance.
+    value: { get_attr: [haproxy_instance, name] }
+  ip:
+    description: The IP address of the HAProxy instance.
+    value: { get_attr: [haproxy_instance, first_address] }
+  port:
+    description: The network port of the HAProxy instance.
+    value: { get_resource: port }
